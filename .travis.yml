@@ -1,5 +1,7 @@
 language: ruby
 
+os: linux
+
 before_install:
   - gem install bundler
 
@@ -7,21 +9,21 @@ after_success:
   - bundle exec danger
 
 rvm:
-  - 2.4.6
-  - 2.5.5
-  - 2.6.3
+  - 2.5.8
+  - 2.6.6
+  - 2.7.1
 env:
-  - MODEL_PARSER=grape-swagger-entity
-  - MODEL_PARSER=grape-swagger-representable
-  - GRAPE_VERSION=1.0.3
-  - GRAPE_VERSION=1.2.4
+  - GRAPE_VERSION=1.3.3
+  - GRAPE_VERSION=1.4.0 MODEL_PARSER=grape-swagger-entity
+  - GRAPE_VERSION=1.4.0 MODEL_PARSER=grape-swagger-representable
+  - GRAPE_VERSION=1.4.0
   - GRAPE_VERSION=HEAD
 
-matrix:
+jobs:
   fast_finish: true
 
   include:
-    - rvm: 2.3.8
+    - rvm: 2.4.10
       env:
     - rvm: ruby-head
       env:
@@ -29,6 +31,6 @@ matrix:
       env:
 
   allow_failures:
-    - rvm: 2.3.8
+    - rvm: 2.4.10
     - rvm: ruby-head
     - rvm: jruby-head

@@ -78,12 +78,11 @@ module Grape
     def path_and_definition_objects(namespace_routes, options)
       @paths = {}
       @definitions = {}
-      namespace_routes.each_key do |key|
-        routes = namespace_routes[key]
+      add_definitions_from options[:models]
+      namespace_routes.each_value do |routes|
         path_item(routes, options)
       end
 
-      add_definitions_from options[:models]
       [@paths, @definitions]
     end
 
@@ -121,7 +120,7 @@ module Grape
       method[:consumes]    = consumes_object(route, options[:format])
       method[:parameters]  = params_object(route, options, path)
       method[:security]    = security_object(route)
-      method[:responses]   = response_object(route)
+      method[:responses]   = response_object(route, options)
       method[:tags]        = route.options.fetch(:tags, tag_object(route, path))
       method[:operationId] = GrapeSwagger::DocMethods::OperationId.build(route, path)
       method[:deprecated] = deprecated_object(route)
@@ -176,29 +175,31 @@ module Grape
     end
 
     def params_object(route, options, path)
-      parameters = partition_params(route, options).map do |param, value|
+      parameters = build_request_params(route, options).each_with_object([]) do |(param, value), memo|
+        next if hidden_parameter?(value)
+
         value = { required: false }.merge(value) if value.is_a?(Hash)
         _, value = default_type([[param, value]]).first if value == ''
-        if value[:type]
-          expose_params(value[:type])
-        elsif value[:documentation]
+
+        if value.dig(:documentation, :type)
           expose_params(value[:documentation][:type])
+        elsif value[:type]
+          expose_params(value[:type])
         end
-        GrapeSwagger::DocMethods::ParseParams.call(param, value, path, route, @definitions)
+        memo << GrapeSwagger::DocMethods::ParseParams.call(param, value, path, route, @definitions)
       end
 
-      if GrapeSwagger::DocMethods::MoveParams.can_be_moved?(parameters, route.request_method)
+      if GrapeSwagger::DocMethods::MoveParams.can_be_moved?(route.request_method, parameters)
         parameters = GrapeSwagger::DocMethods::MoveParams.to_definition(path, parameters, route, @definitions)
       end
+
+      GrapeSwagger::DocMethods::FormatData.to_format(parameters)
 
       parameters.presence
     end
 
-    def response_object(route)
-      codes = http_codes_from_route(route)
-      codes.map! { |x| x.is_a?(Array) ? { code: x[0], message: x[1], model: x[2], examples: x[3], headers: x[4] } : x }
-
-      codes.each_with_object({}) do |value, memo|
+    def response_object(route, options)
+      codes(route).each_with_object({}) do |value, memo|
         value[:message] ||= ''
         memo[value[:code]] = { description: value[:message] }
 
@@ -206,21 +207,28 @@ module Grape
 
         next build_file_response(memo[value[:code]]) if file_response?(value[:model])
 
-        response_model = @item
-        response_model = expose_params_from_model(value[:model]) if value[:model]
-
         if memo.key?(200) && route.request_method == 'DELETE' && value[:model].nil?
           memo[204] = memo.delete(200)
           value[:code] = 204
+          next
         end
 
-        next if value[:code] == 204
-        next unless !response_model.start_with?('Swagger_doc') && (@definitions[response_model] || value[:model])
+        # Explicitly request no model with { model: '' }
+        next if value[:model] == ''
 
-        @definitions[response_model][:description] = description_object(route)
+        response_model = value[:model] ? expose_params_from_model(value[:model]) : @item
+        next unless @definitions[response_model]
+        next if response_model.start_with?('Swagger_doc')
 
-        memo[value[:code]][:schema] = build_reference(route, value, response_model)
+        @definitions[response_model][:description] ||= "#{response_model} model"
+        memo[value[:code]][:schema] = build_reference(route, value, response_model, options)
         memo[value[:code]][:examples] = value[:examples] if value[:examples]
+      end
+    end
+
+    def codes(route)
+      http_codes_from_route(route).map do |x|
+        x.is_a?(Array) ? { code: x[0], message: x[1], model: x[2], examples: x[3], headers: x[4] } : x
       end
     end
 
@@ -249,21 +257,39 @@ module Grape
 
     def tag_object(route, path)
       version = GrapeSwagger::DocMethods::Version.get(route)
-      version = [version] unless version.is_a?(Array)
-
+      version = Array(version)
+      prefix = route.prefix.to_s.split('/').reject(&:empty?)
       Array(
         path.split('{')[0].split('/').reject(&:empty?).delete_if do |i|
-          i == route.prefix.to_s || version.map(&:to_s).include?(i)
+          prefix.include?(i) || version.map(&:to_s).include?(i)
         end.first
       ).presence
     end
 
     private
 
-    def build_reference(route, value, response_model)
+    def build_reference(route, value, response_model, settings)
       # TODO: proof that the definition exist, if model isn't specified
       reference = { '$ref' => "#/definitions/#{response_model}" }
-      route.options[:is_array] && value[:code] < 300 ? { type: 'array', items: reference } : reference
+      return reference unless value[:code] < 300
+
+      reference = { type: 'array', items: reference } if route.options[:is_array]
+      build_root(route, reference, response_model, settings)
+    end
+
+    def build_root(route, reference, response_model, settings)
+      default_root = response_model.underscore
+      default_root = default_root.pluralize if route.options[:is_array]
+      case route.settings.dig(:swagger, :root)
+      when true
+        { type: 'object', properties: { default_root => reference } }
+      when false
+        reference
+      when nil
+        settings[:add_root] ? { type: 'object', properties: { default_root => reference } } : reference
+      else
+        { type: 'object', properties: { route.settings.dig(:swagger, :root) => reference } }
+      end
     end
 
     def file_response?(value)
@@ -274,16 +300,13 @@ module Grape
       memo['schema'] = { type: 'file' }
     end
 
-    def partition_params(route, settings)
-      declared_params = route.settings[:declared_params] if route.settings[:declared_params].present?
+    def build_request_params(route, settings)
       required = merge_params(route)
       required = GrapeSwagger::DocMethods::Headers.parse(route) + required unless route.headers.nil?
 
       default_type(required)
 
-      request_params = unless declared_params.nil? && route.headers.nil?
-                         GrapeSwagger::Endpoint::ParamsParser.parse_request_params(required, settings)
-                       end || {}
+      request_params = GrapeSwagger::Endpoint::ParamsParser.parse_request_params(required, settings, self)
 
       request_params.empty? ? required : request_params
     end
@@ -321,13 +344,10 @@ module Grape
       parser = GrapeSwagger.model_parsers.find(model)
       raise GrapeSwagger::Errors::UnregisteredParser, "No parser registered for #{model_name}." unless parser
 
-      properties, required = parser.new(model, self).call
-      unless properties&.any?
-        raise GrapeSwagger::Errors::SwaggerSpec,
-              "Empty model #{model_name}, swagger 2.0 doesn't support empty definitions."
-      end
+      parsed_response = parser.new(model, self).call
 
-      @definitions[model_name] = GrapeSwagger::DocMethods::BuildModelDefinition.build(model, properties, required)
+      @definitions[model_name] =
+        GrapeSwagger::DocMethods::BuildModelDefinition.parse_params_from_model(parsed_response, model, model_name)
 
       model_name
     end
@@ -342,6 +362,16 @@ module Grape
       return route_hidden unless route_hidden.is_a?(Proc)
 
       options[:token_owner] ? route_hidden.call(send(options[:token_owner].to_sym)) : route_hidden.call
+    end
+
+    def hidden_parameter?(value)
+      return false if value.dig(:required)
+
+      if value.dig(:documentation, :hidden).is_a?(Proc)
+        value.dig(:documentation, :hidden).call
+      else
+        value.dig(:documentation, :hidden)
+      end
     end
 
     def success_code_from_entity(route, entity)
